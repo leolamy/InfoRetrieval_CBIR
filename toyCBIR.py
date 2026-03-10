@@ -185,14 +185,74 @@ class ToyCBIRSystem:
 if __name__ == "__main__":
     download_dataset()
     cbir = ToyCBIRSystem()
+    test_paths_file = "test_paths.pkl"          # pour stocker les chemins de test
 
+    # --- Phase d'indexation (première exécution) ---
     if not cbir.load_index():
-        cbir.index_folder(DATASET_DIR)
+        # Récupérer tous les chemins d'images
+        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+        all_files = glob.glob(os.path.join(DATASET_DIR, "**/*"), recursive=True)
+        all_images = [f for f in all_files if f.lower().endswith(valid_exts)]
+        random.shuffle(all_images)
 
-    test_sample = random.sample(cbir.image_paths, 200)
+        # Split train / test (80% / 20%)
+        split = int(0.8 * len(all_images))
+        train_images = all_images[:split]
+        test_images  = all_images[split:]
+
+        print(f"Indexation de {len(train_images)} images d'entraînement...")
+        features_list = []
+        cbir.image_paths = []   # ne contiendra que les images d'entraînement
+
+        for path in tqdm(train_images):
+            feat = cbir.extract_features(path)
+            if feat is not None:
+                features_list.append(feat)
+                cbir.image_paths.append(path)
+
+        if not features_list:
+            print("Aucune feature extraite – abandon.")
+            exit()
+
+        # Construction et sauvegarde de l'index
+        data_matrix = np.array(features_list)
+        cbir.index.addDataPointBatch(data_matrix)
+        print("Construction du graphe HNSW...")
+        cbir.index.createIndex({'M': 16, 'post': 2, 'efConstruction': 200}, print_progress=True)
+        cbir.index.saveIndex(cbir.index_file, save_data=True)
+        with open(cbir.metadata_file, 'wb') as f:
+            pickle.dump(cbir.image_paths, f)
+
+        # Sauvegarde des chemins de test
+        with open(test_paths_file, 'wb') as f:
+            pickle.dump(test_images, f)
+
+        print(f"Index terminé : {len(cbir.image_paths)} images en base.")
+
+    # --- Phase d'évaluation (toutes exécutions) ---
+    else:
+        # Charger la liste des images de test
+        if os.path.exists(test_paths_file):
+            with open(test_paths_file, 'rb') as f:
+                test_images = pickle.load(f)
+        else:
+            print("Fichier de test introuvable – exécutez d'abord sans index pour créer la séparation.")
+            exit()
+
+    # Vérifier qu'il y a assez d'images de test
+    if len(test_images) == 0:
+        print("Aucune image de test disponible.")
+        exit()
+
+    # Échantillonner 2000 images (ou moins si le jeu de test est plus petit)
+    n_test = min(2000, len(test_images))
+    test_sample = random.sample(test_images, n_test)
+
+    # Évaluation
     cbir.evaluate(test_sample, k_values=[1, 5, 10])
 
-    query = random.choice(cbir.image_paths)
+    # Visualisation d'une requête aléatoire
+    query = random.choice(test_sample)
     if os.path.exists(query):
         res = cbir.search(query, top_k=5)
         cbir.visualize(query, res)
