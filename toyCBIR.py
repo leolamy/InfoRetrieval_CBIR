@@ -18,6 +18,7 @@ W_CNN   = 2.0   # sémantique dominante
 W_COLOR = 1.5   # coloris produit critique
 W_HOG   = 1.0   # silhouette
 W_CANNY = 0.3   # peu discriminant fond blanc
+W_CHI2 = 0.4
 
 
 class ToyCBIRSystem:
@@ -34,6 +35,25 @@ class ToyCBIRSystem:
 
         # Init NMSLIB index HNSW and cosine distance
         self.index = nmslib.init(method='hnsw', space='cosinesimil')
+        self.hsv_features = [] 
+
+    def _hsv_raw(self, img_path):
+        """Histogramme HSV normalisé (proba) pour distance chi-carré."""
+        img = cv2.imread(img_path)
+        if img is None: return None
+        img_hsv = cv2.cvtColor(
+            cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (224, 224)),
+            cv2.COLOR_RGB2HSV
+        )
+        h = cv2.calcHist([img_hsv], [0], None, [32], [0, 180]).flatten()
+        s = cv2.calcHist([img_hsv], [1], None, [32], [0, 256]).flatten()
+        v = cv2.calcHist([img_hsv], [2], None, [32], [0, 256]).flatten()
+        hist = np.concatenate([h, s, v]).astype('float32')
+        return hist / (hist.sum() + 1e-7)
+
+    @staticmethod
+    def chi2_dist(h1, h2):
+        return 0.5 * float(np.sum((h1 - h2) ** 2 / (h1 + h2 + 1e-7)))
 
     def extract_features(self, img_path):
         """Extrait les descripteurs : CNN, Color HSV, HOG, Canny/Sobel et LBP."""
@@ -102,6 +122,7 @@ class ToyCBIRSystem:
             if feat is not None:
                 features_list.append(feat)
                 self.image_paths.append(path)
+                self.hsv_features.append(self.hsv)
 
         if not features_list: return
 
@@ -111,22 +132,44 @@ class ToyCBIRSystem:
         self.index.createIndex({'M': 16, 'post': 2, 'efConstruction': 200}, print_progress=True)
         self.index.saveIndex(self.index_file, save_data=True)
         with open(self.metadata_file, 'wb') as f:
-            pickle.dump(self.image_paths, f)
+             pickle.dump({'paths': self.image_paths,
+                 'hsv':   np.array(self.hsv_features)}, f)
+
         print(f"Done. {len(self.image_paths)} images indexed.")
 
     def load_index(self):
         if os.path.exists(self.index_file) and os.path.exists(self.metadata_file):
             self.index.loadIndex(self.index_file, load_data=True)
             with open(self.metadata_file, 'rb') as f:
-                self.image_paths = pickle.load(f)
+                meta = pickle.load(f)
+            if isinstance(meta, dict):
+                self.image_paths  = meta['paths']
+                self.hsv_features = list(meta['hsv'])
+            else:                          # ancien metadata_v2.pkl sans HSV
+                self.image_paths  = meta
+                self.hsv_features = []
             return True
         return False
 
     def search(self, query_path, top_k=5):
         query_feat = self.extract_features(query_path)
         if query_feat is None: return []
-        indices, distances = self.index.knnQuery(query_feat, k=top_k)
-        return [(self.image_paths[idx], distances[i]) for i, idx in enumerate(indices)]
+
+        n_cand = min(top_k * 10, len(self.image_paths))
+        indices, cosine_dists = self.index.knnQuery(query_feat, k=n_cand)
+
+        if self.hsv_features:
+            q_hsv = self._hsv_raw(query_path)
+            if q_hsv is not None:
+                scored = [
+                    (idx, c + self.W_CHI2 * self.chi2_dist(q_hsv, self.hsv_features[idx]))
+                    for idx, c in zip(indices, cosine_dists)
+                ]
+                scored.sort(key=lambda x: x[1])
+                return [(self.image_paths[idx], dist) for idx, dist in scored[:top_k]]
+
+        return [(self.image_paths[idx], cosine_dists[i])
+                for i, idx in enumerate(indices[:top_k])]
 
     def visualize(self, query_path, results):
         query_class = os.path.basename(os.path.dirname(query_path))
@@ -150,24 +193,43 @@ class ToyCBIRSystem:
         plt.show()
 
     def evaluate(self, test_images, k_values=[1, 5, 10]):
+        from collections import Counter
         results = {k: [] for k in k_values}
+        ap_list = []
 
+        # Compte des items par classe dans la galerie (pour dénominateur AP)
+        class_counts = Counter(
+            os.path.basename(os.path.dirname(p)) for p in self.image_paths
+        )
+
+        max_k = max(k_values)
         for query_path in tqdm(test_images, desc="Evaluating"):
             query_class = os.path.basename(os.path.dirname(query_path))
-            retrieved = self.search(query_path, top_k=max(k_values) + 1)
-            retrieved = [(p, d) for p, d in retrieved if p != query_path]
+            retrieved   = self.search(query_path, top_k=max_k + 1)
+            retrieved   = [(p, d) for p, d in retrieved if p != query_path]
 
             for k in k_values:
-                top_k_classes = [
-                    os.path.basename(os.path.dirname(p))
-                    for p, _ in retrieved[:k]
-                ]
+                top_k_classes = [os.path.basename(os.path.dirname(p))
+                                for p, _ in retrieved[:k]]
                 results[k].append(1 if query_class in top_k_classes else 0)
+
+            # Average Precision
+            hits, prec_sum = 0, 0.0
+            for rank, (p, _) in enumerate(retrieved, start=1):
+                if os.path.basename(os.path.dirname(p)) == query_class:
+                    hits     += 1
+                    prec_sum += hits / rank
+            n_relevant = max(class_counts[query_class] -
+                            (1 if query_path in self.image_paths else 0), 1)
+            ap_list.append(prec_sum / n_relevant)
 
         print("\n--- Recall@K ---")
         for k in k_values:
             print(f"  Recall@{k}: {np.mean(results[k]):.4f}")
-        return {k: np.mean(v) for k, v in results.items()}
+        print(f"\n--- mAP@{max_k} ---")
+        print(f"  mAP: {np.mean(ap_list):.4f}")
+
+        return {k: np.mean(v) for k, v in results.items()}, np.mean(ap_list)
 
 
 # --- USING THE TOY CBIR ---
@@ -195,6 +257,7 @@ if __name__ == "__main__":
             if feat is not None:
                 features_list.append(feat)
                 cbir.image_paths.append(path)
+                cbir.hsv_features.append(hsv)
 
         if not features_list:
             print("Aucune feature extraite – abandon.")
@@ -206,7 +269,8 @@ if __name__ == "__main__":
         cbir.index.createIndex({'M': 16, 'post': 2, 'efConstruction': 200}, print_progress=True)
         cbir.index.saveIndex(cbir.index_file, save_data=True)
         with open(cbir.metadata_file, 'wb') as f:
-            pickle.dump(cbir.image_paths, f)
+            pickle.dump({'paths': cbir.image_paths,
+                          'hsv':   np.array(cbir.hsv_features)}, f)
         with open(test_paths_file, 'wb') as f:
             pickle.dump(test_images, f)
 
