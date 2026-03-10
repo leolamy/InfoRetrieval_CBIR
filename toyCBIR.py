@@ -8,9 +8,16 @@ from tqdm import tqdm
 from skimage.feature import hog
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
 from tensorflow.keras.preprocessing import image
+from skimage.feature import local_binary_pattern
 from download_data import download_dataset, DATASET_DIR
 import random
 import glob
+
+# Weights Jusitfied for stanford online products dataset 
+W_CNN   = 2.0   # sémantique dominante
+W_COLOR = 1.5   # coloris produit critique
+W_HOG   = 1.0   # silhouette
+W_CANNY = 0.3   # peu discriminant fond blanc
 
 
 class ToyCBIRSystem:
@@ -26,7 +33,8 @@ class ToyCBIRSystem:
         self.dimension = 2472 
         
         # Init NMSLIB index HNSW and L2 distance
-        self.index = nmslib.init(method='hnsw', space='l2') #, data_type=nmslib.DataType.FLOAT)
+        self.index = nmslib.init(method='hnsw', space='cosinesimil') #, data_type=nmslib.DataType.FLOAT)
+        self.dimension = 2498
 
     def extract_features(self, img_path):
         """Extrae descriptores: CNN, Color HSV, HOG y Bordes Canny."""
@@ -63,6 +71,12 @@ class ToyCBIRSystem:
         # Calculate gradients for get line directions
         sobely = cv2.Sobel(edges, cv2.CV_64F, 0, 1, ksize=3) # Horizontal
         sobelx = cv2.Sobel(edges, cv2.CV_64F, 1, 0, ksize=3) # Vertical
+
+        # --- E. LBP (Local Texture) ---
+        lbp = local_binary_pattern(img_gray, P=24, R=3, method='uniform')
+        feat_lbp, _ = np.histogram(lbp.ravel(), bins=26, range=(0, 26))
+        feat_lbp = feat_lbp.astype('float32')
+        feat_lbp /= (np.linalg.norm(feat_lbp) + 1e-7)
         
         # Classify borders in 4 bins (0°, 45°, 90°, 135°)
         angles = np.arctan2(sobely, sobelx) * 180 / np.pi
@@ -71,8 +85,13 @@ class ToyCBIRSystem:
         feat_canny = feat_canny.astype('float32')
         feat_canny /= (np.linalg.norm(feat_canny) + 1e-7) # normalize
 
-        # Concatenate normalized descriptors (Early Fusion)
-        return np.concatenate([feat_cnn, feat_color, feat_hog, feat_canny]).astype('float32')
+        return np.concatenate([
+            feat_cnn   * W_CNN,
+            feat_color * W_COLOR,
+            feat_hog   * W_HOG,
+            feat_canny * W_CANNY,
+            feat_lbp   * 0.8   # texture matière
+        ]).astype('float32')
 
     def index_folder(self, folder_path):
         print(f"Indexing folder: {folder_path}...")
@@ -118,22 +137,49 @@ class ToyCBIRSystem:
         return [(self.image_paths[idx], distances[i]) for i, idx in enumerate(indices)]
 
     def visualize(self, query_path, results):
+        query_class = os.path.basename(os.path.dirname(query_path))
         n = len(results)
         fig, axes = plt.subplots(1, n + 1, figsize=(20, 5))
         
-        # Query
         axes[0].imshow(cv2.cvtColor(cv2.imread(query_path), cv2.COLOR_BGR2RGB))
-        axes[0].set_title("IMAGEN CONSULTA")
+        axes[0].set_title(f"QUERY\n[{query_class}]")
         axes[0].axis('off')
 
-        # Results
         for i, (path, dist) in enumerate(results):
+            ret_class = os.path.basename(os.path.dirname(path))
+            is_correct = (ret_class == query_class)
+            color = 'green' if is_correct else 'red'
+            
             axes[i+1].imshow(cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB))
-            axes[i+1].set_title(f"Rank {i+1}\nDist: {dist:.3f}")
+            axes[i+1].set_title(
+                f"Rank {i+1} | Dist: {dist:.3f}\n[{ret_class}]",
+                color=color
+            )
             axes[i+1].axis('off')
         
         plt.tight_layout()
+        plt.savefig(f"result_{os.path.basename(query_path)}.png", dpi=150)
         plt.show()
+
+    def evaluate(self, test_images, k_values=[1, 5, 10]):
+        results = {k: [] for k in k_values}
+
+        for query_path in tqdm(test_images, desc="Evaluating"):
+            query_class = os.path.basename(os.path.dirname(query_path))
+            retrieved = self.search(query_path, top_k=max(k_values) + 1)
+            retrieved = [(p, d) for p, d in retrieved if p != query_path]
+
+            for k in k_values:
+                top_k_classes = [
+                    os.path.basename(os.path.dirname(p))
+                    for p, _ in retrieved[:k]
+                ]
+                results[k].append(1 if query_class in top_k_classes else 0)
+
+        print("\n--- Recall@K ---")
+        for k in k_values:
+            print(f"  Recall@{k}: {np.mean(results[k]):.4f}")
+        return {k: np.mean(v) for k, v in results.items()}
 
 # --- USING THE TOY CBIR ---
 if __name__ == "__main__":
@@ -143,7 +189,10 @@ if __name__ == "__main__":
     if not cbir.load_index():
         cbir.index_folder(DATASET_DIR)
 
-    query = random.choice(cbir.image_paths) 
+    test_sample = random.sample(cbir.image_paths, 200)
+    cbir.evaluate(test_sample, k_values=[1, 5, 10])
+
+    query = random.choice(cbir.image_paths)
     if os.path.exists(query):
         res = cbir.search(query, top_k=5)
         cbir.visualize(query, res)

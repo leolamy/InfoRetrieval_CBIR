@@ -3,7 +3,6 @@ import zipfile
 import os
 
 DATASET_DIR = "./mini_dataset"
-FILE_ID = "1Cc_E4zFEKZaZl9hq8VW-X89iYgZq99sD"
 LOCAL_ZIP = "mini_dataset.zip"
 
 def download_dataset():
